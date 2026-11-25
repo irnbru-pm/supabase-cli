@@ -157,7 +157,7 @@ export const ssoAdd = Effect.fn("sso.add")(function* (flags: SsoAddFlags) {
     // token must not preempt those errors. The cache fill uses the
     // failure-absorbing variant below instead.
     const reconciledTokenCached = Option.isSome(reconciledProfile)
-      ? yield* Effect.cached(accessTokenForProfile(reconciledProfile.value.name))
+      ? yield* Effect.cached(accessTokenForProfile(reconciledProfile.value.name, reconciledProfile.value.apiUrl))
       : undefined;
     const reconciledTokenForAux =
       reconciledTokenCached === undefined

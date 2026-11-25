@@ -1,3 +1,4 @@
+import { readSession, writeSession } from "./irnbru.ts";
 import {
   Config,
   ConfigProvider,
@@ -389,189 +390,47 @@ const readFallbackFile = (
     return trimmed.length === 0 ? Option.none<string>() : Option.some(trimmed);
   });
 
-/**
- * Resolves an access token for an explicit profile account: env token → keyring (profile
- * account, then legacy account) → fallback file. Used by commands that reconcile a
- * profile resolved from raw argv after `CommandCredentials` already captured a different one at
- * construction. Fails with the same validation error as `resolveAccessToken` and propagates
- * credential storage failures.
- */
+// A saved production token may only be used with the production Management API.
+function managedProfile(profile: string, apiUrl: string): string {
+  if (apiUrl !== "https://api.supabase.com") throw new Error("Unsupported IrnBru credential endpoint");
+  return profile;
+}
+
 export const accessTokenForProfile = Effect.fn("CommandCredentials.accessTokenForProfile")(
-  function* (profileAccount: string) {
-    const fs = yield* FileSystem.FileSystem;
-    const path = yield* Path.Path;
-    const runtimeInfo = yield* RuntimeInfo;
-    const cliSettings = yield* CommandSettings;
-    const configProvider = yield* ConfigProvider.ConfigProvider;
-    // Keeps the logger optional — a no-op outside the real CLI tree.
-    const debugLogger: DebugLoggerShape = Option.getOrElse(
-      yield* Effect.serviceOption(DebugLogger),
-      () => ({ debug: () => Effect.void, http: () => Effect.void }),
-    );
-
-    if (Option.isSome(cliSettings.accessToken)) {
-      yield* debugLogger.debug("Using access token from env var...");
-      yield* validateAccessToken(Redacted.value(cliSettings.accessToken.value));
-      return Option.some(cliSettings.accessToken.value);
+  function* (profile: string, apiUrl?: string) {
+    const settings = yield* CommandSettings;
+    if (Option.isSome(settings.accessToken)) {
+      yield* validateAccessToken(Redacted.value(settings.accessToken.value), "env");
+      return settings.accessToken;
     }
-
-    const noKeyring = yield* Config.option(Config.String("SUPABASE_NO_KEYRING")).parse(
-      configProvider,
-    );
-    const keyringModule = yield* loadKeyringModule(fs, noKeyring);
-    const keyringValue = yield* logKeyringSource(
-      yield* lookupKeyringForAccount(keyringModule, profileAccount, runtimeInfo.platform),
-      profileAccount,
-      debugLogger,
-    );
-    if (Option.isSome(keyringValue)) {
-      yield* validateAccessToken(keyringValue.value);
-      return Option.some(Redacted.make(keyringValue.value));
-    }
-
-    const fallbackPath = path.join(cliSettings.supabaseHome, "access-token");
-    const fileValue = yield* readFallbackFile(fs, fallbackPath);
-    if (Option.isSome(fileValue)) {
-      yield* debugLogger.debug(`Using access token from file: ${fallbackPath}`);
-      yield* validateAccessToken(fileValue.value);
-      return Option.some(Redacted.make(fileValue.value));
-    }
-
-    return Option.none<Redacted.Redacted<string>>();
+    const raw = yield* Effect.sync(() => readSession(managedProfile(profile, apiUrl ?? settings.apiUrl)));
+    if (raw === null) return Option.none<Redacted.Redacted<string>>();
+    const { token } = JSON.parse(raw);
+    yield* validateAccessToken(token, "stored");
+    return Option.some(Redacted.make<string>(token));
   },
 );
 
 const makeCommandCredentials = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
   const runtimeInfo = yield* RuntimeInfo;
-  const cliSettings = yield* CommandSettings;
-  const configProvider = yield* ConfigProvider.ConfigProvider;
-  const noKeyring = yield* Config.option(Config.String("SUPABASE_NO_KEYRING")).parse(
-    configProvider,
-  );
-  const debugLogger = yield* DebugLogger;
-  const profileAccount = cliSettings.profile;
-
-  // <SUPABASE_HOME or ~/.supabase>/access-token — fallback file path
-  const fallbackDir = cliSettings.supabaseHome;
-  const fallbackPath = path.join(fallbackDir, "access-token");
-
+  const settings = yield* CommandSettings;
+  const provider = yield* ConfigProvider.ConfigProvider;
+  const noKeyring = yield* Config.option(Config.String("SUPABASE_NO_KEYRING")).parse(provider);
   const keyringModule = yield* loadKeyringModule(fs, noKeyring);
-  yield* Effect.annotateCurrentSpan({ "keyring.enabled": Option.isSome(keyringModule) });
-
-  /* Read the keychain once per command: on macOS each read by an untrusted binary prompts. */
-  const [lookupKeyring, invalidateKeyring] = yield* Effect.cachedInvalidateWithTTL(
-    lookupKeyringForAccount(keyringModule, profileAccount, runtimeInfo.platform).pipe(
-      Effect.tap((token) =>
-        Effect.annotateCurrentSpan({
-          "keyring.entry": Option.match(token, {
-            onNone: () => "none",
-            onSome: ({ account }) => account,
-          }),
-        }),
-      ),
-      Effect.withSpan("CommandCredentials.readKeyring"),
-    ),
-    Duration.infinity,
-  );
-  const readKeyring = lookupKeyring.pipe(
-    Effect.flatMap((token) => logKeyringSource(token, profileAccount, debugLogger)),
-  );
-
-  const readFile = readFallbackFile(fs, fallbackPath);
-
+  const profile = () => managedProfile(settings.profile, settings.apiUrl);
+  const read = accessTokenForProfile(settings.profile);
+  const getAccessToken = yield* Effect.provideService(read, CommandSettings, settings).pipe(Effect.cached);
   return CommandCredentials.of({
-    getAccessToken: Effect.gen(function* () {
-      if (Option.isSome(cliSettings.accessToken)) {
-        yield* debugLogger.debug("Using access token from env var...");
-        yield* validateAccessToken(Redacted.value(cliSettings.accessToken.value), "env");
-        yield* Effect.annotateCurrentSpan({ "credential.source": "env" });
-        return Option.some(cliSettings.accessToken.value);
-      }
-
-      // Skipped on WSL.
-      const keyringValue = yield* readKeyring;
-      if (Option.isSome(keyringValue)) {
-        yield* validateAccessToken(keyringValue.value, "stored");
-        yield* Effect.annotateCurrentSpan({ "credential.source": "keyring" });
-        return Option.some(Redacted.make(keyringValue.value));
-      }
-
-      const fileValue = yield* readFile;
-      if (Option.isSome(fileValue)) {
-        yield* debugLogger.debug(`Using access token from file: ${fallbackPath}`);
-        yield* validateAccessToken(fileValue.value, "stored");
-        yield* Effect.annotateCurrentSpan({ "credential.source": "file" });
-        return Option.some(Redacted.make(fileValue.value));
-      }
-
-      yield* Effect.annotateCurrentSpan({ "credential.source": "none" });
-      return Option.none();
-    }).pipe(Effect.withSpan("CommandCredentials.getAccessToken")),
-
+    getAccessToken,
     saveAccessToken: Effect.fn("CommandCredentials.saveAccessToken")(function* (token: string) {
       yield* validateAccessToken(token);
-      if (Option.isSome(keyringModule)) {
-        const ok = yield* tryKeyringWrite(
-          keyringModule.value,
-          profileAccount,
-          token,
-          runtimeInfo.platform,
-        ).pipe(Effect.ensuring(invalidateKeyring));
-        if (ok) {
-          yield* Effect.annotateCurrentSpan({ "credential.destination": "keyring" });
-          return;
-        }
-      }
-      // The containing directory is world-readable (0755); only the token file itself must
-      // be private (0600).
-      yield* fs.makeDirectory(fallbackDir, { recursive: true, mode: 0o755 });
-      yield* fs.writeFileString(fallbackPath, token, { mode: 0o600 });
-      yield* Effect.annotateCurrentSpan({ "credential.destination": "file" });
+      yield* Effect.sync(() => writeSession(profile(), JSON.stringify({ token })));
     }),
-
-    deleteAccessToken: Effect.gen(function* () {
-      // Removes the fallback token file first; a missing file is ignored, but any other
-      // failure aborts before the keyring is touched.
-      yield* fs.remove(fallbackPath).pipe(
-        Effect.catchTag("PlatformError", (error) =>
-          Predicate.isTagged(error.reason, "NotFound")
-            ? Effect.void
-            : Effect.fail(
-                new DeleteTokenError({
-                  message: `failed to remove access token file: ${error.message}`,
-                }),
-              ),
-        ),
-      );
-
-      // Best-effort delete of the legacy `access-token` keyring account; errors here don't
-      // affect the result.
-      if (Option.isSome(keyringModule)) {
-        yield* tryKeyringDelete(keyringModule.value, LEGACY_KEYRING_ACCOUNT, runtimeInfo.platform);
-      }
-
-      // Deleting the profile keyring account decides the outcome; no keyring backend (WSL,
-      // `SUPABASE_NO_KEYRING`, unsupported) maps to `NotLoggedInError`.
-      if (Option.isNone(keyringModule)) {
-        return yield* new NotLoggedInError({ message: NOT_LOGGED_IN_MESSAGE });
-      }
-      const outcome = yield* deleteProfileKeyringEntry(
-        keyringModule.value,
-        profileAccount,
-        runtimeInfo.platform,
-      ).pipe(Effect.ensuring(invalidateKeyring));
-      if (outcome === "notFound") {
-        return yield* new NotLoggedInError({ message: NOT_LOGGED_IN_MESSAGE });
-      }
-    }).pipe(Effect.withSpan("CommandCredentials.deleteAccessToken")),
-
+    deleteAccessToken: Effect.sync(() => writeSession(profile(), null)),
     deleteAllProjectCredentials: Effect.gen(function* () {
       if (Option.isNone(keyringModule)) return;
-      yield* deleteAllKeyringEntries(keyringModule.value, runtimeInfo.platform).pipe(
-        Effect.ensuring(invalidateKeyring),
-      );
+      yield* deleteAllKeyringEntries(keyringModule.value, runtimeInfo.platform);
     }).pipe(Effect.withSpan("CommandCredentials.deleteAllProjectCredentials")),
 
     deleteProjectCredential: Effect.fn("CommandCredentials.deleteProjectCredential")(function* (
